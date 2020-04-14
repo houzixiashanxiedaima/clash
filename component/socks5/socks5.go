@@ -2,10 +2,13 @@ package socks5
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"strconv"
+
+	"github.com/Dreamacro/clash/component/auth"
 )
 
 // Error represents a SOCKS error
@@ -35,8 +38,49 @@ const (
 // MaxAddrLen is the maximum size of SOCKS address in bytes.
 const MaxAddrLen = 1 + 1 + 255 + 2
 
+// MaxAuthLen is the maximum size of user/password field in SOCKS5 Auth
+const MaxAuthLen = 255
+
 // Addr represents a SOCKS address as defined in RFC 1928 section 5.
-type Addr = []byte
+type Addr []byte
+
+func (a Addr) String() string {
+	var host, port string
+
+	switch a[0] {
+	case AtypDomainName:
+		hostLen := uint16(a[1])
+		host = string(a[2 : 2+hostLen])
+		port = strconv.Itoa((int(a[2+hostLen]) << 8) | int(a[2+hostLen+1]))
+	case AtypIPv4:
+		host = net.IP(a[1 : 1+net.IPv4len]).String()
+		port = strconv.Itoa((int(a[1+net.IPv4len]) << 8) | int(a[1+net.IPv4len+1]))
+	case AtypIPv6:
+		host = net.IP(a[1 : 1+net.IPv6len]).String()
+		port = strconv.Itoa((int(a[1+net.IPv6len]) << 8) | int(a[1+net.IPv6len+1]))
+	}
+
+	return net.JoinHostPort(host, port)
+}
+
+// UDPAddr converts a socks5.Addr to *net.UDPAddr
+func (a Addr) UDPAddr() *net.UDPAddr {
+	if len(a) == 0 {
+		return nil
+	}
+	switch a[0] {
+	case AtypIPv4:
+		var ip [net.IPv4len]byte
+		copy(ip[0:], a[1:1+net.IPv4len])
+		return &net.UDPAddr{IP: net.IP(ip[:]), Port: int(binary.BigEndian.Uint16(a[1+net.IPv4len : 1+net.IPv4len+2]))}
+	case AtypIPv6:
+		var ip [net.IPv6len]byte
+		copy(ip[0:], a[1:1+net.IPv6len])
+		return &net.UDPAddr{IP: net.IP(ip[:]), Port: int(binary.BigEndian.Uint16(a[1+net.IPv6len : 1+net.IPv6len+2]))}
+	}
+	// Other Atyp
+	return nil
+}
 
 // SOCKS errors as defined in RFC 1928 section 6.
 const (
@@ -50,13 +94,16 @@ const (
 	ErrAddressNotSupported  = Error(8)
 )
 
+// Auth errors used to return a specific "Auth failed" error
+var ErrAuth = errors.New("auth failed")
+
 type User struct {
 	Username string
 	Password string
 }
 
 // ServerHandshake fast-tracks SOCKS initialization to get target address to connect on server side.
-func ServerHandshake(rw io.ReadWriter) (addr Addr, command Command, err error) {
+func ServerHandshake(rw net.Conn, authenticator auth.Authenticator) (addr Addr, command Command, err error) {
 	// Read RFC 1928 for request and reply structure and sizes.
 	buf := make([]byte, MaxAddrLen)
 	// read VER, NMETHODS, METHODS
@@ -67,32 +114,96 @@ func ServerHandshake(rw io.ReadWriter) (addr Addr, command Command, err error) {
 	if _, err = io.ReadFull(rw, buf[:nmethods]); err != nil {
 		return
 	}
+
 	// write VER METHOD
-	if _, err = rw.Write([]byte{5, 0}); err != nil {
-		return
+	if authenticator != nil {
+		if _, err = rw.Write([]byte{5, 2}); err != nil {
+			return
+		}
+
+		// Get header
+		header := make([]byte, 2)
+		if _, err = io.ReadFull(rw, header); err != nil {
+			return
+		}
+
+		authBuf := make([]byte, MaxAuthLen)
+		// Get username
+		userLen := int(header[1])
+		if userLen <= 0 {
+			rw.Write([]byte{1, 1})
+			err = ErrAuth
+			return
+		}
+		if _, err = io.ReadFull(rw, authBuf[:userLen]); err != nil {
+			return
+		}
+		user := string(authBuf[:userLen])
+
+		// Get password
+		if _, err = rw.Read(header[:1]); err != nil {
+			return
+		}
+		passLen := int(header[0])
+		if passLen <= 0 {
+			rw.Write([]byte{1, 1})
+			err = ErrAuth
+			return
+		}
+		if _, err = io.ReadFull(rw, authBuf[:passLen]); err != nil {
+			return
+		}
+		pass := string(authBuf[:passLen])
+
+		// Verify
+		if ok := authenticator.Verify(string(user), string(pass)); !ok {
+			rw.Write([]byte{1, 1})
+			err = ErrAuth
+			return
+		}
+
+		// Response auth state
+		if _, err = rw.Write([]byte{1, 0}); err != nil {
+			return
+		}
+	} else {
+		if _, err = rw.Write([]byte{5, 0}); err != nil {
+			return
+		}
 	}
+
 	// read VER CMD RSV ATYP DST.ADDR DST.PORT
 	if _, err = io.ReadFull(rw, buf[:3]); err != nil {
 		return
 	}
 
-	if buf[1] != CmdConnect && buf[1] != CmdUDPAssociate {
-		err = ErrCommandNotSupported
-		return
-	}
-
 	command = buf[1]
-	addr, err = readAddr(rw, buf)
+	addr, err = ReadAddr(rw, buf)
 	if err != nil {
 		return
 	}
-	// write VER REP RSV ATYP BND.ADDR BND.PORT
-	_, err = rw.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+
+	switch command {
+	case CmdConnect, CmdUDPAssociate:
+		// Acquire server listened address info
+		localAddr := ParseAddr(rw.LocalAddr().String())
+		if localAddr == nil {
+			err = ErrAddressNotSupported
+		} else {
+			// write VER REP RSV ATYP BND.ADDR BND.PORT
+			_, err = rw.Write(bytes.Join([][]byte{{5, 0, 0}, localAddr}, []byte{}))
+		}
+	case CmdBind:
+		fallthrough
+	default:
+		err = ErrCommandNotSupported
+	}
+
 	return
 }
 
 // ClientHandshake fast-tracks SOCKS initialization to get target address to connect on client side.
-func ClientHandshake(rw io.ReadWriter, addr Addr, cammand Command, user *User) error {
+func ClientHandshake(rw io.ReadWriter, addr Addr, command Command, user *User) (Addr, error) {
 	buf := make([]byte, MaxAddrLen)
 	var err error
 
@@ -103,16 +214,16 @@ func ClientHandshake(rw io.ReadWriter, addr Addr, cammand Command, user *User) e
 		_, err = rw.Write([]byte{5, 1, 0})
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// VER, METHOD
 	if _, err := io.ReadFull(rw, buf[:2]); err != nil {
-		return err
+		return nil, err
 	}
 
 	if buf[0] != 5 {
-		return errors.New("SOCKS version error")
+		return nil, errors.New("SOCKS version error")
 	}
 
 	if buf[1] == 2 {
@@ -125,33 +236,34 @@ func ClientHandshake(rw io.ReadWriter, addr Addr, cammand Command, user *User) e
 		authMsg.WriteString(user.Password)
 
 		if _, err := rw.Write(authMsg.Bytes()); err != nil {
-			return err
+			return nil, err
 		}
 
 		if _, err := io.ReadFull(rw, buf[:2]); err != nil {
-			return err
+			return nil, err
 		}
 
 		if buf[1] != 0 {
-			return errors.New("rejected username/password")
+			return nil, errors.New("rejected username/password")
 		}
 	} else if buf[1] != 0 {
-		return errors.New("SOCKS need auth")
+		return nil, errors.New("SOCKS need auth")
 	}
 
 	// VER, CMD, RSV, ADDR
-	if _, err := rw.Write(bytes.Join([][]byte{{5, cammand, 0}, addr}, []byte(""))); err != nil {
-		return err
+	if _, err := rw.Write(bytes.Join([][]byte{{5, command, 0}, addr}, []byte{})); err != nil {
+		return nil, err
 	}
 
-	if _, err := io.ReadFull(rw, buf[:10]); err != nil {
-		return err
+	// VER, REP, RSV
+	if _, err := io.ReadFull(rw, buf[:3]); err != nil {
+		return nil, err
 	}
 
-	return nil
+	return ReadAddr(rw, buf)
 }
 
-func readAddr(r io.Reader, b []byte) (Addr, error) {
+func ReadAddr(r io.Reader, b []byte) (Addr, error) {
 	if len(b) < MaxAddrLen {
 		return nil, io.ErrShortBuffer
 	}
@@ -244,4 +356,74 @@ func ParseAddr(s string) Addr {
 	addr[len(addr)-2], addr[len(addr)-1] = byte(portnum>>8), byte(portnum)
 
 	return addr
+}
+
+// ParseAddrToSocksAddr parse a socks addr from net.addr
+// This is a fast path of ParseAddr(addr.String())
+func ParseAddrToSocksAddr(addr net.Addr) Addr {
+	var hostip net.IP
+	var port int
+	if udpaddr, ok := addr.(*net.UDPAddr); ok {
+		hostip = udpaddr.IP
+		port = udpaddr.Port
+	} else if tcpaddr, ok := addr.(*net.TCPAddr); ok {
+		hostip = tcpaddr.IP
+		port = tcpaddr.Port
+	}
+
+	// fallback parse
+	if hostip == nil {
+		return ParseAddr(addr.String())
+	}
+
+	var parsed Addr
+	if ip4 := hostip.To4(); ip4.DefaultMask() != nil {
+		parsed = make([]byte, 1+net.IPv4len+2)
+		parsed[0] = AtypIPv4
+		copy(parsed[1:], ip4)
+		binary.BigEndian.PutUint16(parsed[1+net.IPv4len:], uint16(port))
+
+	} else {
+		parsed = make([]byte, 1+net.IPv6len+2)
+		parsed[0] = AtypIPv6
+		copy(parsed[1:], hostip)
+		binary.BigEndian.PutUint16(parsed[1+net.IPv6len:], uint16(port))
+	}
+	return parsed
+}
+
+// DecodeUDPPacket split `packet` to addr payload, and this function is mutable with `packet`
+func DecodeUDPPacket(packet []byte) (addr Addr, payload []byte, err error) {
+	if len(packet) < 5 {
+		err = errors.New("insufficient length of packet")
+		return
+	}
+
+	// packet[0] and packet[1] are reserved
+	if !bytes.Equal(packet[:2], []byte{0, 0}) {
+		err = errors.New("reserved fields should be zero")
+		return
+	}
+
+	if packet[2] != 0 /* fragments */ {
+		err = errors.New("discarding fragmented payload")
+		return
+	}
+
+	addr = SplitAddr(packet[3:])
+	if addr == nil {
+		err = errors.New("failed to read UDP header")
+	}
+
+	payload = packet[3+len(addr):]
+	return
+}
+
+func EncodeUDPPacket(addr Addr, payload []byte) (packet []byte, err error) {
+	if addr == nil {
+		err = errors.New("address is invalid")
+		return
+	}
+	packet = bytes.Join([][]byte{{0, 0, 0}, addr, payload}, []byte{})
+	return
 }

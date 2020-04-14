@@ -1,7 +1,9 @@
 package constant
 
 import (
+	"encoding/json"
 	"net"
+	"strconv"
 )
 
 // Socks addr type
@@ -14,6 +16,7 @@ const (
 	UDP
 
 	HTTP Type = iota
+	HTTPCONNECT
 	SOCKS
 	REDIR
 )
@@ -27,25 +30,74 @@ func (n *NetWork) String() string {
 	return "udp"
 }
 
+func (n NetWork) MarshalJSON() ([]byte, error) {
+	return json.Marshal(n.String())
+}
+
 type Type int
+
+func (t Type) String() string {
+	switch t {
+	case HTTP:
+		return "HTTP"
+	case HTTPCONNECT:
+		return "HTTP Connect"
+	case SOCKS:
+		return "Socks5"
+	case REDIR:
+		return "Redir"
+	default:
+		return "Unknown"
+	}
+}
+
+func (t Type) MarshalJSON() ([]byte, error) {
+	return json.Marshal(t.String())
+}
 
 // Metadata is used to store connection address
 type Metadata struct {
-	NetWork  NetWork
-	Type     Type
-	SrcIP    *net.IP
-	DstIP    *net.IP
-	SrcPort  string
-	DstPort  string
-	AddrType int
-	Host     string
+	NetWork  NetWork `json:"network"`
+	Type     Type    `json:"type"`
+	SrcIP    net.IP  `json:"sourceIP"`
+	DstIP    net.IP  `json:"destinationIP"`
+	SrcPort  string  `json:"sourcePort"`
+	DstPort  string  `json:"destinationPort"`
+	AddrType int     `json:"-"`
+	Host     string  `json:"host"`
+}
+
+func (m *Metadata) RemoteAddress() string {
+	return net.JoinHostPort(m.String(), m.DstPort)
+}
+
+func (m *Metadata) SourceAddress() string {
+	return net.JoinHostPort(m.SrcIP.String(), m.SrcPort)
+}
+
+func (m *Metadata) Resolved() bool {
+	return m.DstIP != nil
+}
+
+func (m *Metadata) UDPAddr() *net.UDPAddr {
+	if m.NetWork != UDP || m.DstIP == nil {
+		return nil
+	}
+	port, _ := strconv.Atoi(m.DstPort)
+	return &net.UDPAddr{
+		IP:   m.DstIP,
+		Port: port,
+	}
 }
 
 func (m *Metadata) String() string {
-	if m.Host == "" {
+	if m.Host != "" {
+		return m.Host
+	} else if m.DstIP != nil {
 		return m.DstIP.String()
+	} else {
+		return "<nil>"
 	}
-	return m.Host
 }
 
 func (m *Metadata) Valid() bool {

@@ -9,13 +9,17 @@ import (
 	"time"
 
 	adapters "github.com/Dreamacro/clash/adapters/inbound"
+	C "github.com/Dreamacro/clash/constant"
+
 	"github.com/Dreamacro/clash/common/pool"
 )
 
-func (t *Tunnel) handleHTTP(request *adapters.HTTPAdapter, outbound net.Conn) {
-	conn := newTrafficTrack(outbound, t.traffic)
+func handleHTTP(request *adapters.HTTPAdapter, outbound net.Conn) {
 	req := request.R
 	host := req.Host
+
+	inboundReeder := bufio.NewReader(request)
+	outboundReeder := bufio.NewReader(outbound)
 
 	for {
 		keepAlive := strings.TrimSpace(strings.ToLower(req.Header.Get("Proxy-Connection"))) == "keep-alive"
@@ -23,17 +27,27 @@ func (t *Tunnel) handleHTTP(request *adapters.HTTPAdapter, outbound net.Conn) {
 		req.Header.Set("Connection", "close")
 		req.RequestURI = ""
 		adapters.RemoveHopByHopHeaders(req.Header)
-		err := req.Write(conn)
+		err := req.Write(outbound)
 		if err != nil {
 			break
 		}
-		br := bufio.NewReader(conn)
-		resp, err := http.ReadResponse(br, req)
+
+	handleResponse:
+		resp, err := http.ReadResponse(outboundReeder, req)
 		if err != nil {
 			break
 		}
 		adapters.RemoveHopByHopHeaders(resp.Header)
-		if resp.ContentLength >= 0 {
+
+		if resp.StatusCode == http.StatusContinue {
+			err = resp.Write(request)
+			if err != nil {
+				break
+			}
+			goto handleResponse
+		}
+
+		if keepAlive || resp.ContentLength >= 0 {
 			resp.Header.Set("Proxy-Connection", "keep-alive")
 			resp.Header.Set("Connection", "keep-alive")
 			resp.Header.Set("Keep-Alive", "timeout=4")
@@ -46,11 +60,15 @@ func (t *Tunnel) handleHTTP(request *adapters.HTTPAdapter, outbound net.Conn) {
 			break
 		}
 
-		if !keepAlive {
+		// even if resp.Write write body to the connection, but some http request have to Copy to close it
+		buf := pool.BufPool.Get().([]byte)
+		_, err = io.CopyBuffer(request, resp.Body, buf)
+		pool.BufPool.Put(buf[:cap(buf)])
+		if err != nil && err != io.EOF {
 			break
 		}
 
-		req, err = http.ReadRequest(bufio.NewReader(request))
+		req, err = http.ReadRequest(inboundReeder)
 		if err != nil {
 			break
 		}
@@ -63,52 +81,40 @@ func (t *Tunnel) handleHTTP(request *adapters.HTTPAdapter, outbound net.Conn) {
 	}
 }
 
-func (t *Tunnel) handleSocket(request *adapters.SocketAdapter, outbound net.Conn) {
-	conn := newTrafficTrack(outbound, t.traffic)
-	relay(request, conn)
+func handleUDPToRemote(packet C.UDPPacket, pc C.PacketConn, metadata *C.Metadata) {
+	if _, err := pc.WriteWithMetadata(packet.Data(), metadata); err != nil {
+		return
+	}
+	DefaultManager.Upload() <- int64(len(packet.Data()))
 }
 
-func (t *Tunnel) handleUDPOverTCP(conn net.Conn, pc net.PacketConn, addr net.Addr) error {
-	ch := make(chan error, 1)
-
-	go func() {
-		buf := pool.BufPool.Get().([]byte)
-		defer pool.BufPool.Put(buf)
-		for {
-			n, err := conn.Read(buf)
-			if err != nil {
-				ch <- err
-				return
-			}
-			pc.SetReadDeadline(time.Now().Add(120 * time.Second))
-			if _, err = pc.WriteTo(buf[:n], addr); err != nil {
-				ch <- err
-				return
-			}
-			t.traffic.Up() <- int64(n)
-			ch <- nil
-		}
-	}()
-
+func handleUDPToLocal(packet C.UDPPacket, pc net.PacketConn, key string, fAddr net.Addr) {
 	buf := pool.BufPool.Get().([]byte)
-	defer pool.BufPool.Put(buf)
+	defer pool.BufPool.Put(buf[:cap(buf)])
+	defer natTable.Delete(key)
+	defer pc.Close()
 
 	for {
-		pc.SetReadDeadline(time.Now().Add(120 * time.Second))
-		n, _, err := pc.ReadFrom(buf)
+		pc.SetReadDeadline(time.Now().Add(udpTimeout))
+		n, from, err := pc.ReadFrom(buf)
 		if err != nil {
-			break
+			return
 		}
 
-		if _, err := conn.Write(buf[:n]); err != nil {
-			break
+		if fAddr != nil {
+			from = fAddr
 		}
 
-		t.traffic.Down() <- int64(n)
+		n, err = packet.WriteBack(buf[:n], from)
+		if err != nil {
+			return
+		}
+		DefaultManager.Download() <- int64(n)
 	}
+}
 
-	<-ch
-	return nil
+func handleSocket(request *adapters.SocketAdapter, outbound net.Conn) {
+	relay(request, outbound)
 }
 
 // relay copies between left and right bidirectionally.

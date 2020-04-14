@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strconv"
 	"time"
 
-	A "github.com/Dreamacro/clash/adapters/outbound"
+	"github.com/Dreamacro/clash/adapters/outbound"
+	"github.com/Dreamacro/clash/adapters/outboundgroup"
 	C "github.com/Dreamacro/clash/constant"
-	T "github.com/Dreamacro/clash/tunnel"
+	"github.com/Dreamacro/clash/tunnel"
 
 	"github.com/go-chi/chi"
 	"github.com/go-chi/render"
@@ -29,13 +29,9 @@ func proxyRouter() http.Handler {
 	return r
 }
 
-// When name is composed of a partial escape string, Golang does not unescape it
 func parseProxyName(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		name := chi.URLParam(r, "name")
-		if newName, err := url.PathUnescape(name); err == nil {
-			name = newName
-		}
+		name := getEscapeParam(r, "name")
 		ctx := context.WithValue(r.Context(), CtxKeyProxyName, name)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -44,7 +40,7 @@ func parseProxyName(next http.Handler) http.Handler {
 func findProxyByName(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := r.Context().Value(CtxKeyProxyName).(string)
-		proxies := T.Instance().Proxies()
+		proxies := tunnel.Proxies()
 		proxy, exist := proxies[name]
 		if !exist {
 			render.Status(r, http.StatusNotFound)
@@ -58,7 +54,7 @@ func findProxyByName(next http.Handler) http.Handler {
 }
 
 func getProxies(w http.ResponseWriter, r *http.Request) {
-	proxies := T.Instance().Proxies()
+	proxies := tunnel.Proxies()
 	render.JSON(w, r, render.M{
 		"proxies": proxies,
 	})
@@ -81,8 +77,8 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	proxy := r.Context().Value(CtxKeyProxy).(*A.Proxy)
-	selector, ok := proxy.ProxyAdapter.(*A.Selector)
+	proxy := r.Context().Value(CtxKeyProxy).(*outbound.Proxy)
+	selector, ok := proxy.ProxyAdapter.(*outboundgroup.Selector)
 	if !ok {
 		render.Status(r, http.StatusBadRequest)
 		render.JSON(w, r, newError("Must be a Selector"))
@@ -110,27 +106,23 @@ func getProxyDelay(w http.ResponseWriter, r *http.Request) {
 
 	proxy := r.Context().Value(CtxKeyProxy).(C.Proxy)
 
-	sigCh := make(chan uint16)
-	go func() {
-		t, err := proxy.URLTest(url)
-		if err != nil {
-			sigCh <- 0
-		}
-		sigCh <- t
-	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeout))
+	defer cancel()
 
-	select {
-	case <-time.After(time.Millisecond * time.Duration(timeout)):
-		render.Status(r, http.StatusRequestTimeout)
+	delay, err := proxy.URLTest(ctx, url)
+	if ctx.Err() != nil {
+		render.Status(r, http.StatusGatewayTimeout)
 		render.JSON(w, r, ErrRequestTimeout)
-	case t := <-sigCh:
-		if t == 0 {
-			render.Status(r, http.StatusServiceUnavailable)
-			render.JSON(w, r, newError("An error occurred in the delay test"))
-		} else {
-			render.JSON(w, r, render.M{
-				"delay": t,
-			})
-		}
+		return
 	}
+
+	if err != nil || delay == 0 {
+		render.Status(r, http.StatusServiceUnavailable)
+		render.JSON(w, r, newError("An error occurred in the delay test"))
+		return
+	}
+
+	render.JSON(w, r, render.M{
+		"delay": delay,
+	})
 }

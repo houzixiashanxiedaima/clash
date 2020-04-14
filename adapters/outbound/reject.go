@@ -1,6 +1,8 @@
-package adapters
+package outbound
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net"
 	"time"
@@ -12,8 +14,12 @@ type Reject struct {
 	*Base
 }
 
-func (r *Reject) Dial(metadata *C.Metadata) (net.Conn, error) {
-	return &NopConn{}, nil
+func (r *Reject) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+	return NewConn(&NopConn{}, r), nil
+}
+
+func (r *Reject) DialUDP(metadata *C.Metadata) (C.PacketConn, error) {
+	return nil, errors.New("match reject rule")
 }
 
 func NewReject() *Reject {
@@ -21,6 +27,7 @@ func NewReject() *Reject {
 		Base: &Base{
 			name: "REJECT",
 			tp:   C.Reject,
+			udp:  true,
 		},
 	}
 }

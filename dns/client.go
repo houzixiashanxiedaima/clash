@@ -2,269 +2,65 @@ package dns
 
 import (
 	"context"
-	"crypto/tls"
-	"errors"
+	"fmt"
 	"net"
 	"strings"
-	"sync"
-	"time"
 
-	"github.com/Dreamacro/clash/common/cache"
-	"github.com/Dreamacro/clash/common/picker"
-	"github.com/Dreamacro/clash/component/fakeip"
-	C "github.com/Dreamacro/clash/constant"
+	"github.com/Dreamacro/clash/component/dialer"
 
 	D "github.com/miekg/dns"
-	geoip2 "github.com/oschwald/geoip2-golang"
 )
 
-var (
-	globalSessionCache = tls.NewLRUClientSessionCache(64)
-
-	mmdb     *geoip2.Reader
-	once     sync.Once
-	resolver *Resolver
-)
-
-type Resolver struct {
-	ipv6     bool
-	mapping  bool
-	fakeip   bool
-	pool     *fakeip.Pool
-	fallback []*nameserver
-	main     []*nameserver
-	cache    *cache.Cache
+type client struct {
+	*D.Client
+	r    *Resolver
+	port string
+	host string
 }
 
-type result struct {
-	Msg   *D.Msg
-	Error error
+func (c *client) Exchange(m *D.Msg) (msg *D.Msg, err error) {
+	return c.ExchangeContext(context.Background(), m)
 }
 
-func isIPRequest(q D.Question) bool {
-	if q.Qclass == D.ClassINET && (q.Qtype == D.TypeA || q.Qtype == D.TypeAAAA) {
-		return true
-	}
-	return false
-}
-
-func (r *Resolver) Exchange(m *D.Msg) (msg *D.Msg, err error) {
-	if len(m.Question) == 0 {
-		return nil, errors.New("should have one question at least")
-	}
-
-	q := m.Question[0]
-	cache, expireTime := r.cache.GetWithExpire(q.String())
-	if cache != nil {
-		msg = cache.(*D.Msg).Copy()
-		setMsgTTL(msg, uint32(expireTime.Sub(time.Now()).Seconds()))
-		return
-	}
-	defer func() {
-		if msg == nil {
-			return
+func (c *client) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
+	var ip net.IP
+	if c.r == nil {
+		// a default ip dns
+		ip = net.ParseIP(c.host)
+	} else {
+		var err error
+		if ip, err = c.r.ResolveIP(c.host); err != nil {
+			return nil, fmt.Errorf("use default dns resolve failed: %w", err)
 		}
+	}
 
-		putMsgToCache(r.cache, q.String(), msg)
-		if r.mapping {
-			ips := r.msgToIP(msg)
-			for _, ip := range ips {
-				putMsgToCache(r.cache, ip.String(), msg)
-			}
+	d := dialer.Dialer()
+	if dialer.DialHook != nil {
+		network := "udp"
+		if strings.HasPrefix(c.Client.Net, "tcp") {
+			network = "tcp"
 		}
-	}()
-
-	isIPReq := isIPRequest(q)
-	if isIPReq {
-		msg, err = r.resolveIP(m)
-		return
+		dialer.DialHook(d, network, ip)
 	}
 
-	msg, err = r.exchange(r.main, m)
-	return
-}
+	c.Client.Dialer = d
 
-func (r *Resolver) exchange(servers []*nameserver, m *D.Msg) (msg *D.Msg, err error) {
-	in := make(chan interface{})
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	fast := picker.SelectFast(ctx, in)
-
-	wg := sync.WaitGroup{}
-	wg.Add(len(servers))
-	for _, server := range servers {
-		go func(s *nameserver) {
-			defer wg.Done()
-			msg, _, err := s.Client.Exchange(m, s.Address)
-			if err != nil || msg.Rcode != D.RcodeSuccess {
-				return
-			}
-			in <- &result{Msg: msg, Error: err}
-		}(server)
+	// miekg/dns ExchangeContext doesn't respond to context cancel.
+	// this is a workaround
+	type result struct {
+		msg *D.Msg
+		err error
 	}
-
-	// release in channel
+	ch := make(chan result, 1)
 	go func() {
-		wg.Wait()
-		close(in)
+		msg, _, err := c.Client.Exchange(m, net.JoinHostPort(ip.String(), c.port))
+		ch <- result{msg, err}
 	}()
 
-	elm, exist := <-fast
-	if !exist {
-		return nil, errors.New("All DNS requests failed")
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case ret := <-ch:
+		return ret.msg, ret.err
 	}
-
-	resp := elm.(*result)
-	msg, err = resp.Msg, resp.Error
-	return
-}
-
-func (r *Resolver) resolveIP(m *D.Msg) (msg *D.Msg, err error) {
-	msgCh := r.resolve(r.main, m)
-	if r.fallback == nil {
-		res := <-msgCh
-		msg, err = res.Msg, res.Error
-		return
-	}
-	fallbackMsg := r.resolve(r.fallback, m)
-	res := <-msgCh
-	if res.Error == nil {
-		if mmdb == nil {
-			return nil, errors.New("GeoIP can't use")
-		}
-
-		if ips := r.msgToIP(res.Msg); len(ips) != 0 {
-			if record, _ := mmdb.Country(ips[0]); record.Country.IsoCode == "CN" || record.Country.IsoCode == "" {
-				// release channel
-				go func() { <-fallbackMsg }()
-				msg = res.Msg
-				return msg, err
-			}
-		}
-	}
-
-	res = <-fallbackMsg
-	msg, err = res.Msg, res.Error
-	return
-}
-
-func (r *Resolver) ResolveIP(host string) (ip net.IP, err error) {
-	ip = net.ParseIP(host)
-	if ip != nil {
-		return ip, nil
-	}
-
-	query := &D.Msg{}
-	dnsType := D.TypeA
-	if r.ipv6 {
-		dnsType = D.TypeAAAA
-	}
-	query.SetQuestion(D.Fqdn(host), dnsType)
-
-	msg, err := r.Exchange(query)
-	if err != nil {
-		return nil, err
-	}
-
-	ips := r.msgToIP(msg)
-	if len(ips) == 0 {
-		return nil, errors.New("can't found ip")
-	}
-
-	ip = ips[0]
-	return
-}
-
-func (r *Resolver) msgToIP(msg *D.Msg) []net.IP {
-	ips := []net.IP{}
-
-	for _, answer := range msg.Answer {
-		switch ans := answer.(type) {
-		case *D.AAAA:
-			ips = append(ips, ans.AAAA)
-		case *D.A:
-			ips = append(ips, ans.A)
-		}
-	}
-
-	return ips
-}
-
-func (r *Resolver) IPToHost(ip net.IP) (string, bool) {
-	cache := r.cache.Get(ip.String())
-	if cache == nil {
-		return "", false
-	}
-	fqdn := cache.(*D.Msg).Question[0].Name
-	return strings.TrimRight(fqdn, "."), true
-}
-
-func (r *Resolver) resolve(client []*nameserver, msg *D.Msg) <-chan *result {
-	ch := make(chan *result)
-	go func() {
-		res, err := r.exchange(client, msg)
-		ch <- &result{Msg: res, Error: err}
-	}()
-	return ch
-}
-
-func (r *Resolver) IsMapping() bool {
-	return r.mapping
-}
-
-func (r *Resolver) IsFakeIP() bool {
-	return r.fakeip
-}
-
-type NameServer struct {
-	Net  string
-	Addr string
-}
-
-type nameserver struct {
-	Client  *D.Client
-	Address string
-}
-
-type Config struct {
-	Main, Fallback []NameServer
-	IPv6           bool
-	EnhancedMode   EnhancedMode
-	Pool           *fakeip.Pool
-}
-
-func transform(servers []NameServer) []*nameserver {
-	var ret []*nameserver
-	for _, s := range servers {
-		ret = append(ret, &nameserver{
-			Client: &D.Client{
-				Net: s.Net,
-				TLSConfig: &tls.Config{
-					ClientSessionCache: globalSessionCache,
-				},
-				UDPSize: 4096,
-			},
-			Address: s.Addr,
-		})
-	}
-	return ret
-}
-
-func New(config Config) *Resolver {
-	once.Do(func() {
-		mmdb, _ = geoip2.Open(C.Path.MMDB())
-	})
-
-	r := &Resolver{
-		main:    transform(config.Main),
-		ipv6:    config.IPv6,
-		cache:   cache.New(time.Second * 60),
-		mapping: config.EnhancedMode == MAPPING,
-		fakeip:  config.EnhancedMode == FAKEIP,
-		pool:    config.Pool,
-	}
-	if config.Fallback != nil {
-		r.fallback = transform(config.Fallback)
-	}
-	return r
 }

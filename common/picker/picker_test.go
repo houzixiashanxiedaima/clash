@@ -4,41 +4,36 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
-func sleepAndSend(delay int, in chan<- interface{}, input interface{}) {
-	time.Sleep(time.Millisecond * time.Duration(delay))
-	in <- input
-}
-
-func sleepAndClose(delay int, in chan interface{}) {
-	time.Sleep(time.Millisecond * time.Duration(delay))
-	close(in)
+func sleepAndSend(ctx context.Context, delay int, input interface{}) func() (interface{}, error) {
+	return func() (interface{}, error) {
+		timer := time.NewTimer(time.Millisecond * time.Duration(delay))
+		select {
+		case <-timer.C:
+			return input, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 func TestPicker_Basic(t *testing.T) {
-	in := make(chan interface{})
-	fast := SelectFast(context.Background(), in)
-	go sleepAndSend(20, in, 1)
-	go sleepAndSend(30, in, 2)
-	go sleepAndClose(40, in)
+	picker, ctx := WithContext(context.Background())
+	picker.Go(sleepAndSend(ctx, 30, 2))
+	picker.Go(sleepAndSend(ctx, 20, 1))
 
-	number, exist := <-fast
-	if !exist || number != 1 {
-		t.Error("should recv 1", exist, number)
-	}
+	number := picker.Wait()
+	assert.NotNil(t, number)
+	assert.Equal(t, number.(int), 1)
 }
 
 func TestPicker_Timeout(t *testing.T) {
-	in := make(chan interface{})
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*5)
-	defer cancel()
-	fast := SelectFast(ctx, in)
-	go sleepAndSend(20, in, 1)
-	go sleepAndClose(30, in)
+	picker, ctx := WithTimeout(context.Background(), time.Millisecond*5)
+	picker.Go(sleepAndSend(ctx, 20, 1))
 
-	_, exist := <-fast
-	if exist {
-		t.Error("should recv false")
-	}
+	number := picker.Wait()
+	assert.Nil(t, number)
 }

@@ -2,8 +2,8 @@ package constant
 
 import (
 	"os"
-	"os/user"
 	P "path"
+	"path/filepath"
 )
 
 const Name = "clash"
@@ -12,39 +12,47 @@ const Name = "clash"
 var Path *path
 
 type path struct {
-	homedir string
+	homeDir    string
+	configFile string
 }
 
 func init() {
-	currentUser, err := user.Current()
-	var homedir string
+	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		dir := os.Getenv("HOME")
-		if dir == "" {
-			dir, _ = os.Getwd()
-		}
-		homedir = dir
-	} else {
-		homedir = currentUser.HomeDir
+		homeDir, _ = os.Getwd()
 	}
 
-	homedir = P.Join(homedir, ".config", Name)
-	Path = &path{homedir: homedir}
+	homeDir = P.Join(homeDir, ".config", Name)
+	Path = &path{homeDir: homeDir, configFile: "config.yaml"}
 }
 
 // SetHomeDir is used to set the configuration path
 func SetHomeDir(root string) {
-	Path = &path{homedir: root}
+	Path.homeDir = root
+}
+
+// SetConfig is used to set the configuration file
+func SetConfig(file string) {
+	Path.configFile = file
 }
 
 func (p *path) HomeDir() string {
-	return p.homedir
+	return p.homeDir
 }
 
 func (p *path) Config() string {
-	return P.Join(p.homedir, "config.yml")
+	return p.configFile
+}
+
+// Resolve return a absolute path or a relative path with homedir
+func (p *path) Resolve(path string) string {
+	if !filepath.IsAbs(path) {
+		return filepath.Join(p.HomeDir(), path)
+	}
+
+	return path
 }
 
 func (p *path) MMDB() string {
-	return P.Join(p.homedir, "Country.mmdb")
+	return P.Join(p.homeDir, "Country.mmdb")
 }
